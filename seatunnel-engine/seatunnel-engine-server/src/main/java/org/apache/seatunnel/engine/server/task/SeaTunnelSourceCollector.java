@@ -17,22 +17,33 @@
 
 package org.apache.seatunnel.engine.server.task;
 
-import org.apache.seatunnel.api.common.metrics.Counter;
-import org.apache.seatunnel.api.common.metrics.Meter;
 import org.apache.seatunnel.api.common.metrics.MetricsContext;
 import org.apache.seatunnel.api.source.Collector;
-import org.apache.seatunnel.api.table.event.SchemaChangeEvent;
+import org.apache.seatunnel.api.table.catalog.TablePath;
+import org.apache.seatunnel.api.table.schema.event.SchemaChangeEvent;
+import org.apache.seatunnel.api.table.schema.handler.DataTypeChangeEventDispatcher;
+import org.apache.seatunnel.api.table.schema.handler.DataTypeChangeEventHandler;
+import org.apache.seatunnel.api.table.type.MultipleRowType;
 import org.apache.seatunnel.api.table.type.Record;
+import org.apache.seatunnel.api.table.type.SeaTunnelDataType;
+import org.apache.seatunnel.api.table.type.SeaTunnelRow;
+import org.apache.seatunnel.api.table.type.SeaTunnelRowType;
+import org.apache.seatunnel.common.constants.PluginType;
+import org.apache.seatunnel.core.starter.flowcontrol.FlowControlGate;
+import org.apache.seatunnel.core.starter.flowcontrol.FlowControlStrategy;
+import org.apache.seatunnel.engine.common.exception.SeaTunnelEngineException;
+import org.apache.seatunnel.engine.server.metrics.TaskMetricsCalcContext;
 import org.apache.seatunnel.engine.server.task.flow.OneInputFlowLifeCycle;
+
+import org.apache.commons.collections4.CollectionUtils;
 
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
-
-import static org.apache.seatunnel.api.common.metrics.MetricNames.SOURCE_RECEIVED_COUNT;
-import static org.apache.seatunnel.api.common.metrics.MetricNames.SOURCE_RECEIVED_QPS;
 
 @Slf4j
 public class SeaTunnelSourceCollector<T> implements Collector<T> {
@@ -41,33 +52,65 @@ public class SeaTunnelSourceCollector<T> implements Collector<T> {
 
     private final List<OneInputFlowLifeCycle<Record<?>>> outputs;
 
+    private final MetricsContext metricsContext;
+
+    private final TaskMetricsCalcContext taskMetricsCalcContext;
+
     private final AtomicBoolean schemaChangeBeforeCheckpointSignal = new AtomicBoolean(false);
 
     private final AtomicBoolean schemaChangeAfterCheckpointSignal = new AtomicBoolean(false);
 
-    private final Counter sourceReceivedCount;
-
-    private final Meter sourceReceivedQPS;
-
     private volatile boolean emptyThisPollNext;
+    private final DataTypeChangeEventHandler dataTypeChangeEventHandler =
+            new DataTypeChangeEventDispatcher();
+    private Map<String, SeaTunnelRowType> rowTypeMap = new HashMap<>();
+    private SeaTunnelDataType rowType;
+    private FlowControlGate flowControlGate;
 
     public SeaTunnelSourceCollector(
             Object checkpointLock,
             List<OneInputFlowLifeCycle<Record<?>>> outputs,
-            MetricsContext metricsContext) {
+            MetricsContext metricsContext,
+            FlowControlStrategy flowControlStrategy,
+            SeaTunnelDataType rowType,
+            List<TablePath> tablePaths) {
         this.checkpointLock = checkpointLock;
         this.outputs = outputs;
-        sourceReceivedCount = metricsContext.counter(SOURCE_RECEIVED_COUNT);
-        sourceReceivedQPS = metricsContext.meter(SOURCE_RECEIVED_QPS);
+        this.rowType = rowType;
+        this.metricsContext = metricsContext;
+        if (rowType instanceof MultipleRowType) {
+            ((MultipleRowType) rowType)
+                    .iterator()
+                    .forEachRemaining(type -> this.rowTypeMap.put(type.getKey(), type.getValue()));
+        }
+        this.taskMetricsCalcContext =
+                new TaskMetricsCalcContext(
+                        metricsContext,
+                        PluginType.SOURCE,
+                        CollectionUtils.isNotEmpty(tablePaths),
+                        tablePaths);
+        flowControlGate = FlowControlGate.create(flowControlStrategy);
     }
 
     @Override
     public void collect(T row) {
         try {
+            if (row instanceof SeaTunnelRow) {
+                String tableId = ((SeaTunnelRow) row).getTableId();
+                int size;
+                if (rowType instanceof SeaTunnelRowType) {
+                    size = ((SeaTunnelRow) row).getBytesSize((SeaTunnelRowType) rowType);
+                } else if (rowType instanceof MultipleRowType) {
+                    size = ((SeaTunnelRow) row).getBytesSize(rowTypeMap.get(tableId));
+                } else {
+                    throw new SeaTunnelEngineException(
+                            "Unsupported row type: " + rowType.getClass().getName());
+                }
+                flowControlGate.audit((SeaTunnelRow) row);
+                taskMetricsCalcContext.updateMetrics(row, tableId);
+            }
             sendRecordToNext(new Record<>(row));
             emptyThisPollNext = false;
-            sourceReceivedCount.inc();
-            sourceReceivedQPS.markEvent();
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -76,6 +119,17 @@ public class SeaTunnelSourceCollector<T> implements Collector<T> {
     @Override
     public void collect(SchemaChangeEvent event) {
         try {
+            if (rowType instanceof SeaTunnelRowType) {
+                rowType = dataTypeChangeEventHandler.reset((SeaTunnelRowType) rowType).apply(event);
+            } else if (rowType instanceof MultipleRowType) {
+                String tableId = event.tablePath().toString();
+                rowTypeMap.put(
+                        tableId,
+                        dataTypeChangeEventHandler.reset(rowTypeMap.get(tableId)).apply(event));
+            } else {
+                throw new SeaTunnelEngineException(
+                        "Unsupported row type: " + rowType.getClass().getName());
+            }
             sendRecordToNext(new Record<>(event));
         } catch (IOException e) {
             throw new RuntimeException(e);
@@ -125,10 +179,12 @@ public class SeaTunnelSourceCollector<T> implements Collector<T> {
         return checkpointLock;
     }
 
+    @Override
     public boolean isEmptyThisPollNext() {
         return emptyThisPollNext;
     }
 
+    @Override
     public void resetEmptyThisPollNext() {
         this.emptyThisPollNext = true;
     }

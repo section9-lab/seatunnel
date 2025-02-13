@@ -21,10 +21,11 @@ import org.apache.seatunnel.api.configuration.Option;
 import org.apache.seatunnel.api.configuration.Options;
 import org.apache.seatunnel.api.configuration.ReadonlyConfig;
 import org.apache.seatunnel.api.configuration.util.OptionRule;
+import org.apache.seatunnel.api.options.SinkConnectorCommonOptions;
 import org.apache.seatunnel.api.table.connector.TableSink;
 import org.apache.seatunnel.api.table.factory.Factory;
-import org.apache.seatunnel.api.table.factory.TableFactoryContext;
 import org.apache.seatunnel.api.table.factory.TableSinkFactory;
+import org.apache.seatunnel.api.table.factory.TableSinkFactoryContext;
 
 import com.google.auto.service.AutoService;
 
@@ -52,15 +53,17 @@ public class ConsoleSinkFactory implements TableSinkFactory {
 
     @Override
     public OptionRule optionRule() {
-        return OptionRule.builder().build();
+        return OptionRule.builder()
+                .optional(
+                        LOG_PRINT_DATA,
+                        LOG_PRINT_DELAY,
+                        SinkConnectorCommonOptions.MULTI_TABLE_SINK_REPLICA)
+                .build();
     }
 
     @Override
-    public TableSink createSink(TableFactoryContext context) {
+    public TableSink createSink(TableSinkFactoryContext context) {
         ReadonlyConfig options = context.getOptions();
-        return () ->
-                new ConsoleSink(
-                        context.getCatalogTable().getTableSchema().toPhysicalRowDataType(),
-                        options);
+        return () -> new ConsoleSink(context.getCatalogTable(), options);
     }
 }
